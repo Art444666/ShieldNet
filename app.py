@@ -2,55 +2,42 @@ import os
 from time import time
 from collections import defaultdict, deque
 from ipaddress import ip_address, ip_network
-from flask import Flask, request, redirect, render_template, abort
+from flask import Flask, request, redirect, abort
 
 app = Flask(__name__)
 
 # === Конфигурация ===
 CONFIG = {
-    "protected_site_url": os.getenv("PROTECTED_SITE_URL", "https://example.com"),  # адрес защищаемого сайта
-    "use_xff": os.getenv("USE_XFF", "1") == "1",  # учитывать X-Forwarded-For за прокси
+    "protected_site_url": os.getenv("PROTECTED_SITE_URL", "https://santa-secret.ru/box/Santa20257klass/card"),
     "company_name": os.getenv("COMPANY_NAME", "ShieldNet Security"),
+    "block_page_file": os.getenv("BLOCK_PAGE_FILE", "index.html"),
 
-    # Анти-флуд (IP)
-    "ip_rate_limit": int(os.getenv("IP_RATE_LIMIT", "50")),         # макс запросов за окно
-    "ip_rate_window_sec": int(os.getenv("IP_RATE_WINDOW", "10")),   # окно времени (сек)
-    "ip_ban_sec": int(os.getenv("IP_BAN_SEC", "900")),              # бан IP (сек)
+    "ip_rate_limit": 50,
+    "ip_rate_window_sec": 10,
+    "ip_ban_sec": 900,
 
-    # Анти-DDoS (диапазоны)
-    "range_prefix": int(os.getenv("RANGE_PREFIX", "24")),                  # префикс /24
-    "range_unique_ips_threshold": int(os.getenv("RANGE_UNIQUE", "30")),    # уникальных IP из префикса за окно
-    "range_window_sec": int(os.getenv("RANGE_WINDOW", "10")),              # окно (сек)
-    "range_ban_sec": int(os.getenv("RANGE_BAN_SEC", "1800")),              # бан диапазона (сек)
+    "range_prefix": 24,
+    "range_unique_ips_threshold": 30,
+    "range_window_sec": 10,
+    "range_ban_sec": 100,
 
-    # HyperGuard (злостные нарушители)
-    "hyperguard_threshold": int(os.getenv("HYPERGUARD_THRESHOLD", "5")),   # после N банов → 400
-    "hyperguard_ban_sec": int(os.getenv("HYPERGUARD_BAN_SEC", "86400")),   # длительность HG-бана (сек)
+    "hyperguard_threshold": 5,
+    "hyperguard_ban_sec": 900,
 
-    # Маршрут страницы блокировки
-    "block_page_route": os.getenv("BLOCK_ROUTE", "/blocked"),
-
-    # Белый список
-    "whitelist_ips": set(os.getenv("WHITELIST_IPS", "127.0.0.1").split(",")),
+    "whitelist_ips": {"127.0.0.1"},
 }
 
-# === Хранилища (в памяти) ===
-ip_requests = defaultdict(deque)             # IP -> deque[timestamps]
-ip_bans = {}                                 # IP -> (until_ts, reason)
-range_activity = defaultdict(lambda: {"ips": {}, "events": deque()})  # префикс -> активность
-range_bans = {}                              # CIDR -> (until_ts, reason)
-ip_violations = defaultdict(int)             # IP -> счётчик нарушений (банов)
+# === Хранилища ===
+ip_requests = defaultdict(deque)
+ip_bans = {}
+range_activity = defaultdict(lambda: {"ips": {}, "events": deque()})
+range_bans = {}
+ip_violations = defaultdict(int)
 
-def now():
-    return time()
+def now(): return time()
 
 def get_client_ip():
-    # Если стоит за прокси/балансировщиком — используем X-Forwarded-For
-    if CONFIG["use_xff"]:
-        xff = request.headers.get("X-Forwarded-For")
-        if xff:
-            return xff.split(",")[0].strip()
-    return (request.remote_addr or "").strip()
+    return request.headers.get("X-Forwarded-For", request.remote_addr).split(",")[0].strip()
 
 def ip_to_prefix(ip_str, prefix_len):
     ip = ip_address(ip_str)
@@ -64,8 +51,7 @@ def prune_deque(dq, window_sec):
 
 def is_banned_ip(ip):
     info = ip_bans.get(ip)
-    if not info:
-        return False
+    if not info: return False
     until, _ = info
     if now() > until:
         ip_bans.pop(ip, None)
@@ -74,8 +60,7 @@ def is_banned_ip(ip):
 
 def is_banned_range(prefix):
     info = range_bans.get(prefix)
-    if not info:
-        return False
+    if not info: return False
     until, _ = info
     if now() > until:
         range_bans.pop(prefix, None)
@@ -85,11 +70,8 @@ def is_banned_range(prefix):
 def ban_ip(ip, seconds, reason):
     ip_bans[ip] = (now() + seconds, reason)
     ip_violations[ip] += 1
-    # Перевод в HyperGuard при превышении порога
     if ip_violations[ip] >= CONFIG["hyperguard_threshold"]:
         ip_bans[ip] = (now() + CONFIG["hyperguard_ban_sec"], "HyperGuard")
-        # Лог можно заменить на нормальный логгер
-        print(f"[HyperGuard] {ip} переведён в HyperGuard на {CONFIG['hyperguard_ban_sec']}s")
 
 def ban_range(prefix, seconds, reason):
     range_bans[prefix] = (now() + seconds, reason)
@@ -112,78 +94,53 @@ def record_range_activity(ip):
     prune_deque(act["events"], CONFIG["range_window_sec"])
     cutoff = ts - CONFIG["range_window_sec"]
     stale = [k for k, t in act["ips"].items() if t < cutoff]
-    for k in stale:
-        act["ips"].pop(k, None)
+    for k in stale: act["ips"].pop(k, None)
     return prefix, len(act["ips"])
 
 def should_ban_range(prefix, unique_ips_count):
     return unique_ips_count >= CONFIG["range_unique_ips_threshold"]
 
-def block_redirect(reason, ip):
-    # Редирект на страницу блокировки
-    return redirect(f"{CONFIG['block_page_route']}?ip={ip}&reason={reason}", code=302)
+def render_block_page(ip, reason):
+    # Загружаем blocked.html из той же папки
+    with open(CONFIG["block_page_file"], encoding="utf-8") as f:
+        html = f.read()
+    # Подставляем значения вручную
+    html = html.replace("{{ company }}", CONFIG["company_name"])
+    html = html.replace("{{ ip }}", ip)
+    html = html.replace("{{ reason }}", reason)
+    return html, 403
 
 @app.before_request
 def guard():
-    ip = get_client_ip() or "unknown"
+    ip = get_client_ip()
 
-    # Белый список → сразу пропускаем на защищаемый сайт
     if ip in CONFIG["whitelist_ips"]:
         return redirect(CONFIG["protected_site_url"])
 
-    # HyperGuard: все запросы от злостных нарушителей → 400
     if ip_violations[ip] >= CONFIG["hyperguard_threshold"]:
         abort(400)
 
-    # Проверка банов (IP/диапазон)
     prefix = ip_to_prefix(ip, CONFIG["range_prefix"])
     if is_banned_ip(ip):
-        # Если причина HyperGuard — сразу 400
         _, reason = ip_bans.get(ip, (0, ""))
         if reason == "HyperGuard":
             abort(400)
-        return block_redirect("Слишком частые запросы", ip)
+        return render_block_page(ip, "Слишком частые запросы")
     if is_banned_range(prefix):
-        return block_redirect("Подозрение на DDoS из диапазона", ip)
+        return render_block_page(ip, "Подозрение на DDoS из диапазона")
 
-    # Учёт активности
     record_ip_request(ip)
     pfx, unique_ips = record_range_activity(ip)
 
-    # Локальный анти-флуд (IP)
     if exceeded_ip_rate(ip):
         ban_ip(ip, CONFIG["ip_ban_sec"], "Слишком частые запросы")
-        return block_redirect("Слишком частые запросы", ip)
+        return render_block_page(ip, "Слишком частые запросы")
 
-    # Диапазонный анти-DDoS
     if should_ban_range(pfx, unique_ips):
         ban_range(pfx, CONFIG["range_ban_sec"], "Подозрение на DDoS из диапазона")
-        return block_redirect("Подозрение на DDoS из диапазона", ip)
+        return render_block_page(ip, "Подозрение на DDoS из диапазона")
 
-    # Обычные пользователи → перенаправляем на защищаемый сайт
     return redirect(CONFIG["protected_site_url"])
 
-@app.route(CONFIG["block_page_route"])
-def blocked():
-    ip = request.args.get("ip", "Unknown")
-    reason = request.args.get("reason", "Доступ ограничен")
-    return render_template("blocked.html",
-                           company=CONFIG["company_name"],
-                           ip=ip,
-                           reason=reason), 403
-
-# Админ-эндпоинты (минимум)
-@app.route("/_admin/unban/ip/<ip>", methods=["POST"])
-def unban_ip(ip):
-    ip_bans.pop(ip, None)
-    ip_violations[ip] = 0
-    return {"status": "ok", "message": f"Unbanned {ip}"}
-
-@app.route("/_admin/unban/range/<path:cidr>", methods=["POST"])
-def unban_range(cidr):
-    range_bans.pop(cidr, None)
-    return {"status": "ok", "message": f"Unbanned range {cidr}"}
-
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=8080)
